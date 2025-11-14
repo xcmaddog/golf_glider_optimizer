@@ -42,7 +42,7 @@ Modify these values to change your design constraints.
 """
 Base.@kwdef mutable struct DesignConfig
     # Flight conditions
-    cruise_speed::Float64 = 10.0           # [m/s]
+    cruise_speed::Float64 = 20.0           # [m/s]
     air_density::Float64 = 1.225           # [kg/m³]
     
     # Wing geometry constraints

@@ -42,7 +42,7 @@ Modify these values to change your design constraints.
 """
 Base.@kwdef mutable struct DesignConfig
     # Flight conditions
-    cruise_speed::Float64 = 20.0           # [m/s]
+    cruise_speed::Float64 = 20.0           # [m/s] Updated to 20 m/s
     air_density::Float64 = 1.225           # [kg/m³]
     
     # Wing geometry constraints
@@ -62,7 +62,7 @@ Base.@kwdef mutable struct DesignConfig
     # Component masses
     motor_mass::Float64 = 0.18             # [kg] Motor mass
     motor_x::Float64 = 0.05                # [m] Motor x-position (FIXED at front)
-    battery_mass::Float64 = 0.25           # [kg] Battery mass
+    battery_mass::Float64 = 0.10           # [kg] Battery mass (reduced to ~1800mAh 3S)
     battery_x_initial::Float64 = -0.05     # [m] Initial battery x-position (optimized)
     electronics_mass::Float64 = 0.05       # [kg] Electronics mass (ESC, receiver, servos)
     electronics_x_initial::Float64 = 0.0   # [m] Initial electronics x-position (optimized)
@@ -89,6 +89,7 @@ Base.@kwdef mutable struct DesignConfig
     # Optimization parameters
     stability_margin::Float64 = 0.01       # Minimum damping margin for dynamic modes (relaxed)
     lift_safety_factor::Float64 = 1.0      # Lift requirement multiplier
+    static_margin_min::Float64 = 0.05      # Minimum static margin (NP ahead of CG)
 end
 
 # Global configuration (modify before running optimization)
@@ -345,6 +346,7 @@ function build_configuration(
     htail_x::Real = 1.5,
     vtail_x::Real = 1.5,
     mass_x::Real = 0.0,
+    wing_x::Real = 0.0,
     htail_area::Real = 0.3, 
     vtail_area::Real = 0.15,
     ht_half_span::Real = 0.6, 
@@ -362,7 +364,7 @@ function build_configuration(
     y_half = collect(range(0.0, stop=wing_span/2, length=n))
     
     # Leading edge x-position with sweep (quarter-chord sweep)
-    xle_w = T[-0.25 * c + sweep * (yi/(wing_span/2)) for (c, yi) in zip(chords, y_half)]
+    xle_w = T[wing_x - 0.25 * c + sweep * (yi/(wing_span/2)) for (c, yi) in zip(chords, y_half)]
     zle_w = zeros(T, n)
     theta_w = T[(pi/180) * tw for tw in twists]  # Convert degrees to radians
     phi_w = zeros(T, n)
@@ -879,6 +881,11 @@ Design variables:
   x[2n+4] = mass_x (reference point, not battery position)
   x[2n+5] = battery_x
   x[2n+6] = electronics_x
+  x[2n+7] = wing_x
+  x[2n+8] = htail_area
+  x[2n+9] = vtail_area
+  x[2n+10] = ht_half_span
+  x[2n+11] = vt_height
 """
 function make_objective_and_constraints(n_design, config::DesignConfig)
     n = n_design
@@ -886,7 +893,7 @@ function make_objective_and_constraints(n_design, config::DesignConfig)
     
     # Compute weight requirement from configuration
     # Estimate total mass from components (rough initial estimate)
-    est_mass = config.motor_mass + config.battery_mass + config.electronics_mass + 1.5  # +1.5 kg for structure
+    est_mass = config.motor_mass + config.battery_mass + config.electronics_mass + 0.5  # Reduced structure estimate
     weight_req = est_mass * g * config.lift_safety_factor
     
     # Get camber functions and store them globally (to avoid AD issues)
@@ -908,6 +915,11 @@ function make_objective_and_constraints(n_design, config::DesignConfig)
         mass_x = x[2n+4]
         battery_x = x[2n+5]
         electronics_x = x[2n+6]
+        wing_x = x[2n+7]
+        htail_area = x[2n+8]
+        vtail_area = x[2n+9]
+        ht_half_span = x[2n+10]
+        vt_height = x[2n+11]
         
         # Build configuration (camber functions are retrieved from global storage)
         system, S, c, b, rref, _, _, _ = build_configuration(
@@ -916,7 +928,12 @@ function make_objective_and_constraints(n_design, config::DesignConfig)
             sweep=sweep,
             htail_x=htail_x,
             vtail_x=vtail_x,
-            mass_x=mass_x
+            mass_x=mass_x,
+            wing_x=wing_x,
+            htail_area=htail_area,
+            vtail_area=vtail_area,
+            ht_half_span=ht_half_span,
+            vt_height=vt_height
         )
         
         # Run VLM analysis
@@ -939,12 +956,21 @@ function make_objective_and_constraints(n_design, config::DesignConfig)
         vtail_x_val = vtail_x isa ForwardDiff.Dual ? ForwardDiff.value(vtail_x) : Float64(vtail_x)
         battery_x_val = battery_x isa ForwardDiff.Dual ? ForwardDiff.value(battery_x) : Float64(battery_x)
         electronics_x_val = electronics_x isa ForwardDiff.Dual ? ForwardDiff.value(electronics_x) : Float64(electronics_x)
+        wing_x_val = wing_x isa ForwardDiff.Dual ? ForwardDiff.value(wing_x) : Float64(wing_x)
+        htail_area_val = htail_area isa ForwardDiff.Dual ? ForwardDiff.value(htail_area) : Float64(htail_area)
+        vtail_area_val = vtail_area isa ForwardDiff.Dual ? ForwardDiff.value(vtail_area) : Float64(vtail_area)
+        ht_half_span_val = ht_half_span isa ForwardDiff.Dual ? ForwardDiff.value(ht_half_span) : Float64(ht_half_span)
+        vt_height_val = vt_height isa ForwardDiff.Dual ? ForwardDiff.value(vt_height) : Float64(vt_height)
         
         comps = build_components(wing_span, chords; 
-                                wing_x=0.0, htail_x=htail_x_val, 
+                                wing_x=wing_x_val, htail_x=htail_x_val, 
                                 vtail_x=vtail_x_val,
                                 battery_x=battery_x_val,
-                                electronics_x=electronics_x_val)
+                                electronics_x=electronics_x_val,
+                                htail_area=htail_area_val,
+                                vtail_area=vtail_area_val,
+                                ht_half_span=ht_half_span_val,
+                                vt_height=vt_height_val)
         m_TO, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
         
         # Calculate L/D
@@ -1047,17 +1073,57 @@ function make_objective_and_constraints(n_design, config::DesignConfig)
             idx += 1
         end
         
+        # Extract stability derivatives for static margin calculation
+        CL_alpha = dCF.alpha[3]
+        Cm_alpha = dCM.alpha[2]
+        
         # 11-N) Monotonic chord taper (chords decrease toward tip)
         for i in 1:(n-1)
             g_vec[idx] = chords[i+1] - chords[i]
             idx += 1
         end
         
+        # N+1) Wing must fit on fuselage: wing LE and TE within [0, L_fuse]
+        # Wing quarter-chord at wing_x, so:
+        # LE = wing_x - 0.25*chord, TE = wing_x + 0.75*chord
+        max_chord = maximum(chords)
+        wing_le = wing_x_val - 0.25 * max_chord
+        wing_te = wing_x_val + 0.75 * max_chord
+        g_vec[idx] = -wing_le  # LE must be >= 0
+        idx += 1
+        g_vec[idx] = wing_te - config.max_fuselage_length  # TE must be <= L_fuse
+        idx += 1
+        
+        # N+2) Horizontal tail must fit on fuselage
+        ht_chord = htail_area_val / (2 * ht_half_span_val)
+        ht_le = htail_x_val - 0.25 * ht_chord
+        ht_te = htail_x_val + 0.75 * ht_chord
+        g_vec[idx] = -ht_le
+        idx += 1
+        g_vec[idx] = ht_te - config.max_fuselage_length
+        idx += 1
+        
+        # N+3) Vertical tail must fit on fuselage
+        vt_chord = vtail_area_val / vt_height_val
+        vt_le = vtail_x_val - 0.25 * vt_chord
+        vt_te = vtail_x_val + 0.75 * vt_chord
+        g_vec[idx] = -vt_le
+        idx += 1
+        g_vec[idx] = vt_te - config.max_fuselage_length
+        idx += 1
+        
+        # N+4) Static margin constraint: NP must be ahead of CG
+        # Calculate neutral point
+        x_np = mass_x - (Cm_alpha / (CL_alpha + 1e-12)) * c_val
+        static_margin = (x_np - cg[1]) / c_val
+        g_vec[idx] = config.static_margin_min - static_margin  # SM >= min_SM
+        idx += 1
+        
         return f
     end
     
-    # Updated constraint count: 3 static + 7 dynamic mode + (n-1) chord taper
-    n_constraints = 10 + (n_design - 1)
+    # Updated constraint count: 3 static + 7 dynamic mode + (n-1) chord taper + 7 geometric + 1 static margin
+    n_constraints = 18 + (n_design - 1)
     return objective_and_constraints!, n_constraints
 end
 
@@ -1070,22 +1136,27 @@ function optimize_aircraft(config::DesignConfig=CONFIG)
     println("="^70)
     
     n = config.n_span_sections
-    nd = 2*n + 6  # Total design variables: chords, twists, sweep, htail_x, vtail_x, mass_x, battery_x, electronics_x
+    nd = 2*n + 11  # Total design variables: chords, twists, sweep, htail_x, vtail_x, mass_x, battery_x, electronics_x, wing_x, htail_area, vtail_area, ht_half_span, vt_height
     
     # Create objective and constraints
     objfun, ng = make_objective_and_constraints(n, config)
     
     # Initial guess
     chords0 = 0.3 * ones(n)  # Start with 30cm chords
-    twists0 = range(3.0, stop=-1.0, length=n) |> collect  # Washout (twist) - reduced magnitude
+    twists0 = range(3.0, stop=-1.0, length=n) |> collect  # Washout (twist)
     sweep0 = 0.05  # Reduced initial sweep
     htail_x0 = 0.8  # Closer tail (within 1m fuselage)
     vtail_x0 = 0.8  # Closer tail
     mass_x0 = 0.0
     battery_x0 = config.battery_x_initial
     electronics_x0 = config.electronics_x_initial
+    wing_x0 = 0.2  # Wing positioned aft of motor
+    htail_area0 = 0.15  # Initial horizontal tail area
+    vtail_area0 = 0.08  # Initial vertical tail area
+    ht_half_span0 = 0.3  # Initial h-tail half-span (reduced from 0.6)
+    vt_height0 = 0.25  # Initial v-tail height (reduced from 0.6)
     
-    x0 = vcat(chords0, twists0, [sweep0, htail_x0, vtail_x0, mass_x0, battery_x0, electronics_x0])
+    x0 = vcat(chords0, twists0, [sweep0, htail_x0, vtail_x0, mass_x0, battery_x0, electronics_x0, wing_x0, htail_area0, vtail_area0, ht_half_span0, vt_height0])
     
     # Design variable bounds
     lx = zeros(nd)
@@ -1094,7 +1165,7 @@ function optimize_aircraft(config::DesignConfig=CONFIG)
     # Chord bounds
     for i in 1:n
         lx[i] = 0.1  # Minimum 10cm chord
-        ux[i] = 0.5  # Maximum 50cm chord
+        ux[i] = 0.5  # Maximum 50cm chord (constraint on root chord)
     end
     
     # Twist bounds (degrees)
@@ -1119,11 +1190,31 @@ function optimize_aircraft(config::DesignConfig=CONFIG)
     
     # Battery x-position bounds (can move along fuselage for CG control)
     lx[2n+5] = -0.3
-    ux[2n+5] = 0.3
+    ux[2n+5] = 0.5
     
     # Electronics x-position bounds
     lx[2n+6] = -0.2
-    ux[2n+6] = 0.2
+    ux[2n+6] = 0.3
+    
+    # Wing x-position bounds (can slide along fuselage)
+    lx[2n+7] = 0.0
+    ux[2n+7] = 0.5
+    
+    # Horizontal tail area bounds
+    lx[2n+8] = 0.05  # Minimum 0.05 m²
+    ux[2n+8] = 0.30  # Maximum 0.30 m²
+    
+    # Vertical tail area bounds
+    lx[2n+9] = 0.03  # Minimum 0.03 m²
+    ux[2n+9] = 0.20  # Maximum 0.20 m²
+    
+    # Horizontal tail half-span bounds
+    lx[2n+10] = 0.15  # Minimum 0.15 m
+    ux[2n+10] = 0.5   # Maximum 0.5 m
+    
+    # Vertical tail height bounds
+    lx[2n+11] = 0.15  # Minimum 0.15 m
+    ux[2n+11] = 0.5   # Maximum 0.5 m
     
     # Constraint bounds: g <= 0
     lg = fill(-Inf, ng)
@@ -1148,6 +1239,7 @@ function optimize_aircraft(config::DesignConfig=CONFIG)
     @printf("  Design variables: %d\n", nd)
     @printf("  Constraints: %d\n", ng)
     @printf("  Wing span: %.2f m (%.1f in)\n", 2*config.max_wing_half_span, 2*config.max_wing_half_span*39.3701)
+    @printf("  Max root chord: %.2f m\n", ux[1])
     @printf("  Cruise speed: %.1f m/s\n", config.cruise_speed)
     @printf("  Wing airfoil: %s", config.wing_airfoil_type)
     if config.wing_airfoil_type == "NACA4"
@@ -1168,13 +1260,20 @@ function optimize_aircraft(config::DesignConfig=CONFIG)
     @printf("  Tube specs: OD=%.1f mm, ID=%.1f mm\n", 
             config.fuselage_outer_diameter*1000, config.fuselage_inner_diameter*1000)
     @printf("  Motor mass: %.2f kg at x=%.2f m (FIXED)\n", config.motor_mass, config.motor_x)
-    @printf("  Battery mass: %.2f kg (x-position optimized)\n", config.battery_mass)
+    @printf("  Battery: %.2f kg, %.1f Wh/kg = %.1f Wh total (x optimized)\n", 
+            config.battery_mass, config.battery_specific_energy, 
+            config.battery_mass * config.battery_specific_energy)
     @printf("  Electronics mass: %.2f kg (x-position optimized)\n", config.electronics_mass)
-    @printf("  Battery specific energy: %.1f Wh/kg\n", config.battery_specific_energy)
     @printf("  Propulsion efficiency: %.2f\n", config.propulsion_efficiency)
     @printf("  Max fuselage length: %.2f m\n\n", config.max_fuselage_length)
     
-    println("  Mode-specific handling quality requirements:")
+    println("  Optimizable:")
+    println("    - Wing position (x)")
+    println("    - Horizontal tail: area and span")
+    println("    - Vertical tail: area and height")
+    println("    - Battery and electronics positions")
+    
+    println("\n  Mode-specific handling quality requirements:")
     println("    Short period: ζ ≥ 0.30, ωₙ ≥ 1.0 rad/s")
     println("    Phugoid: Re(λ) < 0")
     println("    Dutch roll: ζ ≥ 0.08, ωₙ ≥ 0.5 rad/s")
@@ -1212,6 +1311,11 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
     mass_x = x[2n+4]
     battery_x = x[2n+5]
     electronics_x = x[2n+6]
+    wing_x = x[2n+7]
+    htail_area = x[2n+8]
+    vtail_area = x[2n+9]
+    ht_half_span = x[2n+10]
+    vt_height = x[2n+11]
     
     if verbose
         println("\n" * "="^70)
@@ -1242,6 +1346,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         
         println("\nGeometry Parameters:")
         println("  Wing span: $(2*config.max_wing_half_span) m ($(2*config.max_wing_half_span*39.3701) in)")
+        @printf("  Wing x-position: %.3f m\n", wing_x)
         println("  Wing chords (root to tip):")
         for (i, c) in enumerate(chords)
             @printf("    Section %d: %.3f m (%.2f in)\n", i, c, c*39.3701)
@@ -1251,8 +1356,8 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
             @printf("    Section %d: %.2f°\n", i, t)
         end
         @printf("\n  Quarter-chord sweep: %.3f m\n", sweep)
-        @printf("  Horizontal tail position: %.3f m\n", htail_x)
-        @printf("  Vertical tail position: %.3f m\n", vtail_x)
+        @printf("  Horizontal tail: x=%.3f m, area=%.4f m², span=%.3f m\n", htail_x, htail_area, 2*ht_half_span)
+        @printf("  Vertical tail: x=%.3f m, area=%.4f m², height=%.3f m\n", vtail_x, vtail_area, vt_height)
         @printf("  CG x-position reference: %.3f m\n", mass_x)
     end
     
@@ -1269,7 +1374,12 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         sweep=sweep,
         htail_x=htail_x,
         vtail_x=vtail_x,
-        mass_x=mass_x
+        mass_x=mass_x,
+        wing_x=wing_x,
+        htail_area=htail_area,
+        vtail_area=vtail_area,
+        ht_half_span=ht_half_span,
+        vt_height=vt_height
     )
     
     # Aerodynamic analysis
@@ -1285,8 +1395,10 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
     
     # Compute inertia for range calculation
     comps = build_components(wing_span, chords; 
-                            wing_x=0.0, htail_x=htail_x, vtail_x=vtail_x,
-                            battery_x=battery_x, electronics_x=electronics_x)
+                            wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
+                            battery_x=battery_x, electronics_x=electronics_x,
+                            htail_area=htail_area, vtail_area=vtail_area,
+                            ht_half_span=ht_half_span, vt_height=vt_height)
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
     # Range calculation: R = (e_b/g) * η * (L/D) * (m_b/m_TO)
@@ -1308,6 +1420,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         @printf("  L/D = %.2f\n", L_over_D)
         @printf("\n  Lift force: %.2f N\n", L)
         @printf("  Drag force: %.2f N\n", D)
+        @printf("  Weight: %.2f N\n", m_tot * g)
         @printf("\n  ** Estimated Range: %.1f m (%.2f km) **\n", range_m, range_m/1000.0)
     end
     
@@ -1341,7 +1454,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         println("\n" * "-"^70)
         println("Mass Properties:")
         println("-"^70)
-        @printf("  Total mass: %.3f kg\n", m_tot)
+        @printf("  Total mass: %.3f kg (%.2f oz)\n", m_tot, m_tot*35.274)
         @printf("  CG position: (%.3f, %.3f, %.3f) m\n", cg[1], cg[2], cg[3])
         @printf("  Ixx = %.4f kg·m²\n", Ixx)
         @printf("  Iyy = %.4f kg·m²\n", Iyy)
@@ -1499,7 +1612,7 @@ function diagnose_constraints(x::Vector{Float64}, config::DesignConfig=CONFIG)
     n = config.n_span_sections
     
     # Create a dummy constraint vector with updated size
-    g_vec = zeros(10 + (n - 1))
+    g_vec = zeros(18 + (n - 1))
     
     # Create objective function to evaluate constraints
     objfun, ng = make_objective_and_constraints(n, config)
@@ -1531,10 +1644,30 @@ function diagnose_constraints(x::Vector{Float64}, config::DesignConfig=CONFIG)
     end
     
     println("\nMonotonic chord constraints:")
-    for i in 11:length(g_vec)
-        status = g_vec[i] <= 0.0 ? "✓" : "✗"
-        @printf("%s Chord taper %d-%d: g[%d] = %.6f %s\n", status, i-10, i-9, i, g_vec[i],
-                g_vec[i] <= 0.0 ? "(satisfied)" : "(VIOLATED)")
+    idx = 11
+    for i in 1:(n-1)
+        status = g_vec[idx] <= 0.0 ? "✓" : "✗"
+        @printf("%s Chord taper %d-%d: g[%d] = %.6f %s\n", status, i, i+1, idx, g_vec[idx],
+                g_vec[idx] <= 0.0 ? "(satisfied)" : "(VIOLATED)")
+        idx += 1
+    end
+    
+    println("\nGeometric packaging constraints:")
+    geometric_names = [
+        "Wing LE on fuselage (LE ≥ 0)",
+        "Wing TE on fuselage (TE ≤ L_fuse)",
+        "H-tail LE on fuselage (LE ≥ 0)",
+        "H-tail TE on fuselage (TE ≤ L_fuse)",
+        "V-tail LE on fuselage (LE ≥ 0)",
+        "V-tail TE on fuselage (TE ≤ L_fuse)",
+        "Static margin (NP ahead of CG by ≥ 5%)"
+    ]
+    
+    for (i, name) in enumerate(geometric_names)
+        status = g_vec[idx] <= 0.0 ? "✓" : "✗"
+        @printf("%s %s: g[%d] = %.6f %s\n", status, name, idx, g_vec[idx],
+                g_vec[idx] <= 0.0 ? "(satisfied)" : "(VIOLATED)")
+        idx += 1
     end
     
     println("="^70)
@@ -1650,6 +1783,67 @@ function load_airfoil!(filepath::String; surface::Symbol=:wing)
     end
 end
 
+"""
+Print design variables in a readable format.
+"""
+function print_design_variables(x::Vector{Float64}, config::DesignConfig=CONFIG)
+    n = config.n_span_sections
+    
+    println("\n" * "="^70)
+    println("DESIGN VARIABLES")
+    println("="^70)
+    
+    # Unpack
+    chords = x[1:n]
+    twists = x[n+1:2n]
+    sweep = x[2n+1]
+    htail_x = x[2n+2]
+    vtail_x = x[2n+3]
+    mass_x = x[2n+4]
+    battery_x = x[2n+5]
+    electronics_x = x[2n+6]
+    wing_x = x[2n+7]
+    htail_area = x[2n+8]
+    vtail_area = x[2n+9]
+    ht_half_span = x[2n+10]
+    vt_height = x[2n+11]
+    
+    println("\nWing Geometry:")
+    @printf("  Position (x): %.4f m\n", wing_x)
+    @printf("  Span: %.4f m (%.2f in)\n", 2*config.max_wing_half_span, 2*config.max_wing_half_span*39.3701)
+    println("  Chords:")
+    for (i, c) in enumerate(chords)
+        @printf("    Section %d: %.4f m (%.2f in)\n", i, c, c*39.3701)
+    end
+    println("  Twists:")
+    for (i, t) in enumerate(twists)
+        @printf("    Section %d: %.4f°\n", i, t)
+    end
+    @printf("  Quarter-chord sweep: %.4f m\n", sweep)
+    
+    println("\nHorizontal Tail:")
+    @printf("  Position (x): %.4f m\n", htail_x)
+    @printf("  Area: %.4f m²\n", htail_area)
+    @printf("  Half-span: %.4f m (%.2f in)\n", ht_half_span, ht_half_span*39.3701)
+    @printf("  Mean chord: %.4f m (%.2f in)\n", htail_area/(2*ht_half_span), htail_area/(2*ht_half_span)*39.3701)
+    @printf("  Aspect ratio: %.2f\n", (2*ht_half_span)^2/htail_area)
+    
+    println("\nVertical Tail:")
+    @printf("  Position (x): %.4f m\n", vtail_x)
+    @printf("  Area: %.4f m²\n", vtail_area)
+    @printf("  Height: %.4f m (%.2f in)\n", vt_height, vt_height*39.3701)
+    @printf("  Mean chord: %.4f m (%.2f in)\n", vtail_area/vt_height, vtail_area/vt_height*39.3701)
+    @printf("  Aspect ratio: %.2f\n", vt_height^2/vtail_area)
+    
+    println("\nComponent Positions:")
+    @printf("  Motor: x = %.4f m (FIXED)\n", config.motor_x)
+    @printf("  Battery: x = %.4f m\n", battery_x)
+    @printf("  Electronics: x = %.4f m\n", electronics_x)
+    @printf("  Reference CG: x = %.4f m\n", mass_x)
+    
+    println("="^70)
+end
+
 # ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
@@ -1689,6 +1883,11 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
     mass_x = x[2n+4]
     battery_x = x[2n+5]
     electronics_x = x[2n+6]
+    wing_x = x[2n+7]
+    htail_area = x[2n+8]
+    vtail_area = x[2n+9]
+    ht_half_span = x[2n+10]
+    vt_height = x[2n+11]
     
     wing_span = 2*config.max_wing_half_span
     
@@ -1702,13 +1901,20 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
         sweep=sweep,
         htail_x=htail_x,
         vtail_x=vtail_x,
-        mass_x=mass_x
+        mass_x=mass_x,
+        wing_x=wing_x,
+        htail_area=htail_area,
+        vtail_area=vtail_area,
+        ht_half_span=ht_half_span,
+        vt_height=vt_height
     )
     
     # Get CG and components
     comps = build_components(wing_span, chords; 
-                            wing_x=0.0, htail_x=htail_x, vtail_x=vtail_x,
-                            battery_x=battery_x, electronics_x=electronics_x)
+                            wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
+                            battery_x=battery_x, electronics_x=electronics_x,
+                            htail_area=htail_area, vtail_area=vtail_area,
+                            ht_half_span=ht_half_span, vt_height=vt_height)
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
     # Calculate neutral point
@@ -1718,11 +1924,11 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
     p = plot(size=(800, 600), legend=:topright, dpi=150)
     
     # Plot wing outline (both halves)
-    y_sections = range(0.0, stop=wing_span/2, length=n)
+    y_sections = collect(range(0.0, stop=wing_span/2, length=n))
     for i in 1:(n-1)
         # Right wing
-        x_le_i = -0.25 * chords[i] + sweep * (y_sections[i]/(wing_span/2))
-        x_le_ip1 = -0.25 * chords[i+1] + sweep * (y_sections[i+1]/(wing_span/2))
+        x_le_i = wing_x - 0.25 * chords[i] + sweep * (y_sections[i]/(wing_span/2))
+        x_le_ip1 = wing_x - 0.25 * chords[i+1] + sweep * (y_sections[i+1]/(wing_span/2))
         x_te_i = x_le_i + chords[i]
         x_te_ip1 = x_le_ip1 + chords[i+1]
         
@@ -1739,14 +1945,15 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
     end
     
     # Close wing tips
-    plot!([x_te_ip1, x_le_ip1], [y_sections[end], y_sections[end]], 
+    x_le_tip = wing_x - 0.25 * chords[end] + sweep
+    x_te_tip = x_le_tip + chords[end]
+    plot!([x_te_tip, x_le_tip], [y_sections[end], y_sections[end]], 
           color=:black, linewidth=2, label="")
-    plot!([x_te_ip1, x_le_ip1], [-y_sections[end], -y_sections[end]], 
+    plot!([x_te_tip, x_le_tip], [-y_sections[end], -y_sections[end]], 
           color=:black, linewidth=2, label="")
     
     # Horizontal tail (simplified rectangle)
-    ht_chord = 0.3 / (2 * 0.6)  # Default values
-    ht_half_span = 0.6
+    ht_chord = htail_area / (2 * ht_half_span)
     ht_xle = htail_x - 0.25 * ht_chord
     ht_xte = ht_xle + ht_chord
     
@@ -1777,7 +1984,8 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
     # Add stability margin indicator
     static_margin = (x_np - cg[1]) / c
     title!(string("Aircraft Top View\n",
-                  "Static Margin: ", @sprintf("%.3f", static_margin), " (x̄_np - x̄_cg)"))
+                  "Static Margin: ", @sprintf("%.3f", static_margin), " (x̄_np - x̄_cg)\n",
+                  "Wing area: ", @sprintf("%.4f", S), " m², H-tail: ", @sprintf("%.3f", htail_area), " m²"))
     xlabel!("x [m]")
     ylabel!("y [m]")
     
@@ -1805,6 +2013,11 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
     mass_x = x[2n+4]
     battery_x = x[2n+5]
     electronics_x = x[2n+6]
+    wing_x = x[2n+7]
+    htail_area = x[2n+8]
+    vtail_area = x[2n+9]
+    ht_half_span = x[2n+10]
+    vt_height = x[2n+11]
     
     wing_span = 2*config.max_wing_half_span
     
@@ -1818,13 +2031,20 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
         sweep=sweep,
         htail_x=htail_x,
         vtail_x=vtail_x,
-        mass_x=mass_x
+        mass_x=mass_x,
+        wing_x=wing_x,
+        htail_area=htail_area,
+        vtail_area=vtail_area,
+        ht_half_span=ht_half_span,
+        vt_height=vt_height
     )
     
     # Get CG and components
     comps = build_components(wing_span, chords; 
-                            wing_x=0.0, htail_x=htail_x, vtail_x=vtail_x,
-                            battery_x=battery_x, electronics_x=electronics_x)
+                            wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
+                            battery_x=battery_x, electronics_x=electronics_x,
+                            htail_area=htail_area, vtail_area=vtail_area,
+                            ht_half_span=ht_half_span, vt_height=vt_height)
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
     # Calculate neutral point
@@ -1835,7 +2055,7 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
     
     # Wing chord at root (side view shows root chord)
     c_root = chords[1]
-    x_le_root = -0.25 * c_root
+    x_le_root = wing_x - 0.25 * c_root
     x_te_root = x_le_root + c_root
     wing_thickness = config.foam_thickness
     
@@ -1845,7 +2065,7 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
           color=:black, linewidth=2, fill=true, fillalpha=0.3, label="Wing")
     
     # Horizontal tail
-    ht_chord = 0.3 / (2 * 0.6)
+    ht_chord = htail_area / (2 * ht_half_span)
     ht_xle = htail_x - 0.25 * ht_chord
     ht_xte = ht_xle + ht_chord
     
@@ -1854,8 +2074,7 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
           color=:black, linewidth=1.5, linestyle=:dash, fill=true, fillalpha=0.2, label="H-Tail")
     
     # Vertical tail
-    vt_height = 0.6
-    vt_chord = 0.15 / vt_height
+    vt_chord = vtail_area / vt_height
     vt_xle = vtail_x - 0.25 * vt_chord
     vt_xte = vt_xle + vt_chord
     
@@ -1887,7 +2106,8 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
     # Add stability margin indicator
     static_margin = (x_np - cg[1]) / c
     title!(string("Aircraft Side View\n",
-                  "Static Margin: ", @sprintf("%.3f", static_margin), " (x̄_np - x̄_cg)"))
+                  "Static Margin: ", @sprintf("%.3f", static_margin), " (x̄_np - x̄_cg)\n",
+                  "V-tail area: ", @sprintf("%.3f", vtail_area), " m²"))
     xlabel!("x [m]")
     ylabel!("z [m]")
     

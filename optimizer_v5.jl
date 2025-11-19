@@ -1356,8 +1356,8 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
             @printf("    Section %d: %.2f°\n", i, t)
         end
         @printf("\n  Quarter-chord sweep: %.3f m\n", sweep)
-        @printf("  Horizontal tail: x=%.3f m, area=%.4f m², span=%.3f m\n", htail_x, htail_area, 2*ht_half_span)
-        @printf("  Vertical tail: x=%.3f m, area=%.4f m², height=%.3f m\n", vtail_x, vtail_area, vt_height)
+        @printf("  Horizontal tail: x=%.3f m, area=%.4f m²\n", htail_x, htail_area)
+        @printf("  Vertical tail: x=%.3f m, area=%.4f m²\n", vtail_x, vtail_area)
         @printf("  CG x-position reference: %.3f m\n", mass_x)
     end
     
@@ -1377,9 +1377,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         mass_x=mass_x,
         wing_x=wing_x,
         htail_area=htail_area,
-        vtail_area=vtail_area,
-        ht_half_span=ht_half_span,
-        vt_height=vt_height
+        vtail_area=vtail_area
     )
     
     # Aerodynamic analysis
@@ -1397,8 +1395,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
     comps = build_components(wing_span, chords; 
                             wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
                             battery_x=battery_x, electronics_x=electronics_x,
-                            htail_area=htail_area, vtail_area=vtail_area,
-                            ht_half_span=ht_half_span, vt_height=vt_height)
+                            htail_area=htail_area, vtail_area=vtail_area)
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
     # Range calculation: R = (e_b/g) * η * (L/D) * (m_b/m_TO)

@@ -34,7 +34,7 @@ Base.@kwdef mutable struct DesignConfig
     air_density::Float64 = 1.225
     
     # Wing geometry constraints (now optimizable)
-    min_wing_half_span::Float64 = 0.5          # [m] Minimum half-span
+    min_wing_half_span::Float64 = 0.1          # [m] Minimum half-span
     max_wing_half_span::Float64 = 0.762        # [m] Maximum half-span (30 inches)
     max_wing_dihedral::Float64 = 15.0          # [deg] Maximum dihedral angle
     n_span_sections::Int = 2                   # Number of design control points
@@ -50,11 +50,11 @@ Base.@kwdef mutable struct DesignConfig
     spar_inner_diameter::Float64 = 0.005
     
     # Component masses (UPDATED with actual values)
-    motor_mass::Float64 = 0.156                # [kg] 156 grams
-    motor_x::Float64 = 0.05
-    battery_mass::Float64 = 0.440              # [kg] 440 grams
-    battery_x_initial::Float64 = -0.05
-    electronics_mass::Float64 = 0.05
+    motor_mass::Float64 = 0.155922 + 0.0326                # [kg] 156 grams (motor) + 32.6 grams (propeller)
+    motor_x::Float64 = -0.03
+    battery_mass::Float64 = 0.365              # [kg] 365 grams
+    battery_x_initial::Float64 = 0.05
+    electronics_mass::Float64 = 0.0934 + 0.05  # [kg] 93.4 grams (speed controller) + 50 grams for ESC, wiring, etc.
     electronics_x_initial::Float64 = 0.0
     ballast_mass_initial::Float64 = 0.0
     ballast_x_initial::Float64 = 0.0
@@ -790,9 +790,9 @@ end
 # ============================================================================
 
 """
-Create objective and constraint functions with enhanced design variables.
+Create objective and constraint functions with α=0° cruise optimization.
 
-NEW Design variables (25 total):
+Design variables (25 total):
   x[1:2] = wing chords (root, tip)
   x[3:4] = wing twists (root, tip)
   x[5] = wing_half_span
@@ -806,18 +806,27 @@ NEW Design variables (25 total):
   x[16:17] = vtail twists (root, tip)
   x[18] = vtail_height
   x[19] = vtail_x
-  x[20] = mass_x (reference point)
+  x[20] = mass_x (reference point) - NOTE: Consider removing in future
   x[21] = battery_x
   x[22] = electronics_x
   x[23] = wing_x
   x[24] = ballast_mass
   x[25] = ballast_x
   
-UPDATED CONSTRAINTS (more realistic for small RC aircraft):
-  - Phugoid: Allowed to be slightly unstable (common in practice)
-  - Spiral: Allowed to be slightly unstable (very common, slow divergence)
-  - Dutch roll damping: Relaxed to ζ ≥ 0.04 (still provides adequate handling)
-  - Roll mode: Relaxed to τ ≤ 2.0 s (more realistic for small aircraft)
+UPDATED CONSTRAINTS FOR α=0° CRUISE:
+  1. Lift requirement at α=0° (must equal weight)
+  2. Trim requirement: |Cm| ≤ 0.01 at α=0°
+  3. Static longitudinal stability: Cm_α < 0
+  4. Static directional stability: Cn_β > 0
+  5-6. Short period mode (ζ ≥ 0.30, ωn ≥ 1.0)
+  7. Phugoid (Re(λ) ≤ +0.05)
+  8-9. Dutch roll (ζ ≥ 0.02, ωn ≥ 0.4)
+  10. Roll mode (τ ≤ 2.0s)
+  11. Spiral mode (Re(λ) ≤ +0.05)
+  12-14. Chord taper constraints
+  15-20. Geometric packaging constraints
+  21. Static margin ≥ 0.10 (REDUCED from 0.15)
+  22-24. Component positioning constraints
 """
 function make_objective_and_constraints(config::DesignConfig)
     # Estimate initial mass for weight requirement
@@ -867,11 +876,14 @@ function make_objective_and_constraints(config::DesignConfig)
             wing_x=wing_x
         )
         
-        # Run VLM analysis
+        # =====================================================================
+        # CRITICAL CHANGE: Run VLM analysis at α=0° for cruise condition
+        # =====================================================================
         CF, CM, dCF, dCM = run_vlm_analysis!(system, S, c, b, rref; 
-                                             α=2.0*pi/180, β=0.0, symmetric=false)
+                                             α=0.0, β=0.0, symmetric=false)
         
         CD, CY, CL = CF
+        Cl, Cm, Cn = CM
         q_dyn = 0.5 * config.air_density * config.cruise_speed^2
         
         S_val = S isa ForwardDiff.Dual ? ForwardDiff.value(S) : Float64(S)
@@ -906,14 +918,14 @@ function make_objective_and_constraints(config::DesignConfig)
         )
         m_TO, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
         
-        # Calculate L/D and range
+        # Calculate L/D and range at cruise condition (α=0°)
         L_over_D = L / (D + 1e-6)
         range_m = (e_b / g) * η * L_over_D * (m_b / m_TO)
         
         # Objective: maximize range
         f = -range_m
         
-        # Assemble state-space matrices
+        # Assemble state-space matrices (using derivatives at α=0°)
         S_val = S isa ForwardDiff.Dual ? ForwardDiff.value(S) : Float64(S)
         c_val = c isa ForwardDiff.Dual ? ForwardDiff.value(c) : Float64(c)
         b_val = b isa ForwardDiff.Dual ? ForwardDiff.value(b) : Float64(b)
@@ -923,30 +935,35 @@ function make_objective_and_constraints(config::DesignConfig)
         
         modes = analyze_modes(A_long, A_lat)
         
-        # Constraints
+        # =====================================================================
+        # CONSTRAINTS
+        # =====================================================================
         idx = 1
         
-        # 1) Lift requirement
+        # 1) Lift requirement at α=0° (must equal weight for level flight)
         g_vec[idx] = weight_req - L
         idx += 1
         
-        # 2) Static longitudinal stability: Cm_α < 0
+        # 2) NEW: Trim requirement: |Cm| ≤ 0.03 at α=0°
+        # This ensures the aircraft is trimmed (no pitching moment) at cruise
+        g_vec[idx] = abs(Cm) - 0.03
+        idx += 1
+        
+        # 3) Static longitudinal stability: Cm_α < 0
         Cm_alpha = dCM.alpha[2]
         g_vec[idx] = Cm_alpha + 1e-3
         idx += 1
         
-        # 3) Static directional stability: Cn_β > 0
+        # 4) Static directional stability: Cn_β > 0
         Cn_beta = dCM.beta[3]
         g_vec[idx] = -Cn_beta + 1e-4
         idx += 1
         
-        # 4-5) Short period mode constraints
+        # 5-6) Short period mode constraints
         if haskey(modes, "short_period")
             sp = modes["short_period"]
-            # ζ_sp ≥ 0.30 (unchanged - important for handling)
             g_vec[idx] = 0.30 - sp.ζ
             idx += 1
-            # ωn_sp ≥ 1.0 rad/s (unchanged)
             g_vec[idx] = 1.0 - sp.ωn
             idx += 1
         else
@@ -955,27 +972,21 @@ function make_objective_and_constraints(config::DesignConfig)
             idx += 2
         end
         
-        # 6) Phugoid mode constraint: RELAXED
-        # Many aircraft have slightly unstable phugoids (very slow, pilot can easily correct)
-        # Allow Re(λ) up to +0.05 (time to double: ~14 seconds, very manageable)
+        # 7) Phugoid mode constraint: RELAXED
         if haskey(modes, "phugoid")
             ph = modes["phugoid"]
-            g_vec[idx] = real(ph.λ) - 0.05  # Allow slight instability
+            g_vec[idx] = real(ph.λ) - 0.05
             idx += 1
         else
             g_vec[idx] = 0.0
             idx += 1
         end
         
-        # 7-8) Dutch roll mode constraints - FURTHER RELAXED
+        # 8-9) Dutch roll mode constraints - RELAXED
         if haskey(modes, "dutch_roll")
             dr = modes["dutch_roll"]
-            # FURTHER RELAXED: ζ_dr ≥ 0.02 (was 0.04, originally 0.08)
-            # Minimal damping acceptable for RC aircraft with human pilot in loop
             g_vec[idx] = 0.02 - dr.ζ
             idx += 1
-            # ωn_dr ≥ 0.4 rad/s (relaxed from 0.5)
-            # Lower frequency oscillation is acceptable
             g_vec[idx] = 0.4 - dr.ωn
             idx += 1
         else
@@ -984,9 +995,7 @@ function make_objective_and_constraints(config::DesignConfig)
             idx += 2
         end
         
-        # 9) Roll mode constraint: RELAXED
-        # τ_roll ≤ 2.0 s (was 1.5 s) → Re(λ) ≤ -0.5 (was -0.67)
-        # Small RC aircraft can have slightly slower roll response
+        # 10) Roll mode constraint: RELAXED
         if haskey(modes, "roll_subsidence")
             roll = modes["roll_subsidence"]
             g_vec[idx] = real(roll.λ) + 0.5
@@ -996,29 +1005,25 @@ function make_objective_and_constraints(config::DesignConfig)
             idx += 1
         end
         
-        # 10) Spiral mode constraint: FURTHER RELAXED
-        # Allow more instability: Re(λ) ≤ +0.05 (was +0.01)
-        # Time to double at λ=0.05 is ~14s, still very manageable
-        # Spiral instability is extremely common and acceptable for RC aircraft
+        # 11) Spiral mode constraint: RELAXED
         if haskey(modes, "spiral")
             spiral = modes["spiral"]
-            g_vec[idx] = real(spiral.λ) - 0.05  # Allow more instability
+            g_vec[idx] = real(spiral.λ) - 0.05
             idx += 1
         else
             g_vec[idx] = 0.0
             idx += 1
         end
         
-        # 11-13) Monotonic chord taper constraints
-        g_vec[idx] = wing_chords[2] - wing_chords[1]  # Wing tip <= root
+        # 12-14) Monotonic chord taper constraints
+        g_vec[idx] = wing_chords[2] - wing_chords[1]
         idx += 1
-        g_vec[idx] = htail_chords[2] - htail_chords[1]  # H-tail tip <= root
+        g_vec[idx] = htail_chords[2] - htail_chords[1]
         idx += 1
-        g_vec[idx] = vtail_chords[2] - vtail_chords[1]  # V-tail tip <= root
+        g_vec[idx] = vtail_chords[2] - vtail_chords[1]
         idx += 1
         
-        # 14-19) Geometric packaging constraints
-        # Wing must fit on fuselage
+        # 15-20) Geometric packaging constraints
         max_wing_chord = maximum(wing_chords)
         wing_le = wing_x_val - 0.25 * max_wing_chord
         wing_te = wing_x_val + 0.75 * max_wing_chord
@@ -1027,7 +1032,6 @@ function make_objective_and_constraints(config::DesignConfig)
         g_vec[idx] = wing_te - config.max_fuselage_length
         idx += 1
         
-        # H-tail must fit on fuselage
         max_ht_chord = maximum(htail_chords)
         ht_le = htail_x_val - 0.25 * max_ht_chord
         ht_te = htail_x_val + 0.75 * max_ht_chord
@@ -1036,7 +1040,6 @@ function make_objective_and_constraints(config::DesignConfig)
         g_vec[idx] = ht_te - config.max_fuselage_length
         idx += 1
         
-        # V-tail must fit on fuselage
         max_vt_chord = maximum(vtail_chords)
         vt_le = vtail_x_val - 0.25 * max_vt_chord
         vt_te = vtail_x_val + 0.75 * max_vt_chord
@@ -1045,27 +1048,26 @@ function make_objective_and_constraints(config::DesignConfig)
         g_vec[idx] = vt_te - config.max_fuselage_length
         idx += 1
         
-        # 20) Static margin: NP must be ahead of CG
+        # 21) Static margin: REDUCED to 0.10 (from 0.15)
         CL_alpha = dCF.alpha[3]
         x_np = mass_x - (Cm_alpha / (CL_alpha + 1e-12)) * c_val
         static_margin = (x_np - cg[1]) / c_val
-        g_vec[idx] = config.static_margin_min - static_margin
+        g_vec[idx] = 0.10 - static_margin  # CHANGED from config.static_margin_min
         idx += 1
         
-        # 21-23) Component positioning constraints: Keep battery, electronics, and ballast behind motor
-        # This ensures proper weight distribution and prevents interference
-        g_vec[idx] = config.motor_x - battery_x_val  # battery_x must be >= motor_x
+        # 22-24) Component positioning constraints
+        g_vec[idx] = config.motor_x - battery_x_val
         idx += 1
-        g_vec[idx] = config.motor_x - electronics_x_val  # electronics_x must be >= motor_x
+        g_vec[idx] = config.motor_x - electronics_x_val
         idx += 1
-        g_vec[idx] = config.motor_x - ballast_x_val  # ballast_x must be >= motor_x (if ballast present)
+        g_vec[idx] = config.motor_x - ballast_x_val
         idx += 1
         
         return f
     end
     
-    # Total constraints: 23 (was 20, added 3 component positioning constraints)
-    n_constraints = 23
+    # Total constraints: 24 (added 1 trim constraint from original 23)
+    n_constraints = 24
     return objective_and_constraints!, n_constraints
 end
 
@@ -1318,7 +1320,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
     
     # Aerodynamic analysis
     CF, CM, dCF, dCM = run_vlm_analysis!(system, S, c, b, rref; 
-                                         α=2.0*pi/180, β=0.0, symmetric=false)
+                                         α=0.0*pi/180, β=0.0, symmetric=false)
     
     CD, CY, CL = CF
     Cl, Cm, Cn = CM
@@ -1351,7 +1353,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
     
     if verbose
         println("\n" * "-"^70)
-        println("Aerodynamic Performance (α = 2°):")
+        println("Aerodynamic Performance (α = 0°):")
         println("-"^70)
         @printf("  Reference area: %.4f m²\n", S)
         @printf("  Reference chord: %.4f m\n", c)
@@ -1454,7 +1456,7 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
 end
 
 function diagnose_constraints(x::Vector{Float64}, config::DesignConfig=CONFIG)
-    g_vec = zeros(23) 
+    g_vec = zeros(24) 
     
     objfun, ng = make_objective_and_constraints(config)
     f = objfun(g_vec, x)
@@ -1465,6 +1467,7 @@ function diagnose_constraints(x::Vector{Float64}, config::DesignConfig=CONFIG)
     
     constraint_names = [
         "Lift requirement",
+        "Trim constraint: |Cm| ≤ 0.03 (at α=0°)",
         "Longitudinal stability (Cm_α < 0)",
         "Directional stability (Cn_β > 0)",
         "Short period damping (ζ ≥ 0.30)",
@@ -1483,7 +1486,7 @@ function diagnose_constraints(x::Vector{Float64}, config::DesignConfig=CONFIG)
         "H-tail TE on fuselage",
         "V-tail LE on fuselage",
         "V-tail TE on fuselage",
-        "Static margin (NP ahead of CG by ≥15%)",
+        "Static margin (NP ahead of CG by ≥10% MAC)",
         "Battery position (behind motor)",
         "Electronics position (behind motor)",
         "Ballast position (behind motor)"
@@ -2120,7 +2123,7 @@ function design_summary(x::Vector{Float64}, config::DesignConfig=CONFIG)
     
     # Run aerodynamic analysis
     CF, CM, dCF, dCM = run_vlm_analysis!(system, S, c, b, rref; 
-                                         α=2.0*pi/180, β=0.0, symmetric=false)
+                                         α=0.0*pi/180, β=0.0, symmetric=false)
     CD, CY, CL = CF
     q_dyn = 0.5 * config.air_density * config.cruise_speed^2
     L = q_dyn * S * CL
@@ -2213,7 +2216,7 @@ function design_summary(x::Vector{Float64}, config::DesignConfig=CONFIG)
     @printf("  Reference MAC:   %.3f m\n", c)
     
     println("\n" * "-"^70)
-    println("AERODYNAMIC PERFORMANCE (α = 2°)")
+    println("AERODYNAMIC PERFORMANCE (α = 0°)")
     println("-"^70)
     @printf("  CL:              %.4f\n", CL)
     @printf("  CD:              %.4f\n", CD)

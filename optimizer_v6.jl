@@ -64,7 +64,8 @@ Base.@kwdef mutable struct DesignConfig
     propulsion_efficiency::Float64 = 0.65
     
     # Fuselage constraints
-    max_fuselage_length::Float64 = 1.0
+    max_fuselage_length::Float64 = 1.0 #this fuselage length is the length of the fiberglass Tube
+    fuselage_width::Float64 = 0.1 #10 cm wide
     
     # Airfoil selection
     wing_airfoil_type::String = "NACA4"
@@ -287,7 +288,8 @@ function build_configuration(
     vtail_height::Real = 0.25,
     vtail_x::Real = 0.8,
     mass_x::Real = 0.0,
-    wing_x::Real = 0.0
+    wing_x::Real = 0.0,
+    fuselage_width::Real = 0.0
 ) where T
     
     n_wing = length(wing_chords)
@@ -300,13 +302,14 @@ function build_configuration(
     # -------------------------------------------------------------------------
     # WING GEOMETRY with dihedral
     # -------------------------------------------------------------------------
-    y_half = collect(range(0.0, stop=wing_half_span, length=n_wing))
+    y_half = collect(range(fuselage_width / 2, stop=(fuselage_width/2) + wing_half_span, length=n_wing))
     
     # Dihedral: z increases linearly with y
     dihedral_rad = T(wing_dihedral * pi / 180.0)
-    zle_w = T[yi * tan(dihedral_rad) for yi in y_half]
+    zle_w = T[(yi - (fuselage_width/2)) * tan(dihedral_rad) for yi in y_half]
     
     # Leading edge with sweep
+    # need to adjust sweep calculations to account for fuselage width
     wing_span = 2 * wing_half_span
     xle_w = T[wing_x - 0.25 * c + sweep * (yi/wing_half_span) for (c, yi) in zip(wing_chords, y_half)]
     
@@ -368,17 +371,20 @@ function build_configuration(
     # -------------------------------------------------------------------------
     # REFERENCE VALUES
     # -------------------------------------------------------------------------
-    # Wing area (trapezoidal approximation)
+    # Wing area (trapezoidal approximation, accounting for fuselage gap)
     wing_area = zero(T)
     for i in 1:(n_wing-1)
         wing_area += 2 * 0.5 * (y_half[i+1] - y_half[i]) * (wing_chords[i] + wing_chords[i+1])
     end
-    
+
     ref_area = wing_area
-    ref_chord = wing_area / wing_span
-    ref_span = T(wing_span)
+    # Wing span now excludes the fuselage gap
+    half_gap = T(fuselage_width / 2.0)
+    actual_wing_span = 2 * (wing_half_span - half_gap)
+    ref_chord = wing_area / actual_wing_span
+    ref_span = T(actual_wing_span)
     rref = [T(mass_x), zero(T), zero(T)]
-    
+
     return system, ref_area, ref_chord, ref_span, rref, surf_w, surf_ht, surf_vt
 end
 
@@ -477,11 +483,12 @@ function build_components(
     battery_x::Float64 = -0.05,
     electronics_x::Float64 = 0.0,
     ballast_mass::Float64 = 0.0,  # NEW
-    ballast_x::Float64 = 0.0       # NEW
+    ballast_x::Float64 = 0.0,       # NEW
+    fuselage_width::Float64 = 0.0   # NEW
 )
     comps = Component[]
     
-    foam_thickness = CONFIG.foam_thickness
+    foam_thickness = CONFIG.foam_thickness # Using this thickness instead of the actual thickness of the airfoil gives us an overestimate of the mass
     rho_foam = CONFIG.foam_density
     rho_spar = CONFIG.spar_density
     rho_fuse = CONFIG.fuselage_density
@@ -492,37 +499,46 @@ function build_components(
     fuse_r_inner = CONFIG.fuselage_inner_diameter / 2.0
     
     # -------------------------------------------------------------------------
-    # WING
+    # WING (accounting for fuselage gap)
     # -------------------------------------------------------------------------
     wing_chords_f = [c isa ForwardDiff.Dual ? ForwardDiff.value(c) : Float64(c) for c in wing_chords]
     c_avg = mean(wing_chords_f)
-    
-    S_wing = 2.0 * (c_avg * wing_half_span)
+
+    # Actual wing span per side (excluding fuselage gap)
+    half_gap = fuselage_width / 2.0
+    wing_panel_span = wing_half_span - half_gap
+
+    S_wing = 2.0 * (c_avg * wing_panel_span)  # Area excludes fuselage gap
     vol_wing = S_wing * foam_thickness
     mass_wing = vol_wing * rho_foam
-    
+
     m_half = mass_wing / 2.0
-    y_centroid = wing_half_span / 2.0
+    # Centroid is at mid-span of actual wing panel (starting from edge of fuselage)
+    y_centroid = half_gap + wing_panel_span / 2.0
     x_centroid = wing_x + c_avg / 2.0
-    
-    Ixx, Iyy, Izz = lamina_inertia(m_half, wing_half_span, c_avg)
+
+    Ixx, Iyy, Izz = lamina_inertia(m_half, wing_panel_span, c_avg)
     push!(comps, Component("wing_right", m_half, x_centroid,  y_centroid, wing_z, Ixx, Iyy, Izz))
     push!(comps, Component("wing_left",  m_half, x_centroid, -y_centroid, wing_z, Ixx, Iyy, Izz))
-    
+
     # -------------------------------------------------------------------------
-    # SPAR
+    # SPAR (accounting for fuselage gap)
     # -------------------------------------------------------------------------
-    wing_span = 2 * wing_half_span
-    vol_spar = π * (spar_r_outer^2 - spar_r_inner^2) * wing_span
+    # Spar spans the full distance including across fuselage
+    wing_span_total = 2 * wing_half_span  # Spar goes all the way across
+    vol_spar = π * (spar_r_outer^2 - spar_r_inner^2) * wing_span_total
     mass_spar = vol_spar * rho_spar
     mass_spar = max(mass_spar, 0.02 * mass_wing)
-    
+
     spar_x = wing_x + 0.25 * c_avg
     m_spar_half = mass_spar / 2.0
-    
+
+    # Spar centroid is at mid-span of full half-span (includes fuselage section)
+    y_spar_centroid = wing_half_span / 2.0
+
     Ixx_s, Iyy_s, Izz_s = rod_inertia(m_spar_half, wing_half_span, :y, spar_r_outer, spar_r_inner)
-    push!(comps, Component("spar_right", m_spar_half, spar_x,  y_centroid, wing_z, Ixx_s, Iyy_s, Izz_s))
-    push!(comps, Component("spar_left",  m_spar_half, spar_x, -y_centroid, wing_z, Ixx_s, Iyy_s, Izz_s))
+    push!(comps, Component("spar_right", m_spar_half, spar_x,  y_spar_centroid, wing_z, Ixx_s, Iyy_s, Izz_s))
+    push!(comps, Component("spar_left",  m_spar_half, spar_x, -y_spar_centroid, wing_z, Ixx_s, Iyy_s, Izz_s))
     
     # -------------------------------------------------------------------------
     # POINT MASSES
@@ -873,7 +889,8 @@ function make_objective_and_constraints(config::DesignConfig)
             vtail_height=vtail_height,
             vtail_x=vtail_x,
             mass_x=mass_x,
-            wing_x=wing_x
+            wing_x=wing_x,
+            fuselage_width = config.fuselage_width
         )
         
         # =====================================================================
@@ -914,7 +931,8 @@ function make_objective_and_constraints(config::DesignConfig)
             battery_x=battery_x_val,
             electronics_x=electronics_x_val,
             ballast_mass=ballast_mass_val,
-            ballast_x=ballast_x_val
+            ballast_x=ballast_x_val,
+            fuselage_width = config.fuselage_width
         )
         m_TO, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
         
@@ -1315,7 +1333,8 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         vtail_height=vtail_height,
         vtail_x=vtail_x,
         mass_x=mass_x,
-        wing_x=wing_x
+        wing_x=wing_x,
+        fuselage_width = config.fuselage_width
     )
     
     # Aerodynamic analysis
@@ -1340,7 +1359,8 @@ function analyze_design(x::Vector{Float64}, config::DesignConfig=CONFIG; verbose
         battery_x=battery_x,
         electronics_x=electronics_x,
         ballast_mass=ballast_mass,
-        ballast_x=ballast_x
+        ballast_x=ballast_x,
+        fuselage_width = config.fuselage_width
     )
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
@@ -1659,7 +1679,7 @@ function quick_test()
     rref = [0.25*cref, 0.0, 0.0]
     
     CF, CM, dCF, dCM = run_vlm_analysis!(system, Sref, cref, bref, rref;
-                                         α=2.0*pi/180, β=0.0, symmetric=false)
+                                         α=0.0*pi/180, β=0.0, symmetric=false)
     
     CD, CY, CL = CF
     
@@ -1718,7 +1738,7 @@ end
 Calculate neutral point (aerodynamic center) location.
 """
 function calculate_neutral_point(system, S, c, b, rref)
-    CF, CM, dCF, dCM = run_vlm_analysis!(system, S, c, b, rref; α=2.0*pi/180, β=0.0)
+    CF, CM, dCF, dCM = run_vlm_analysis!(system, S, c, b, rref; α=0.0*pi/180, β=0.0)
     
     Cm_alpha = dCM.alpha[2]
     CL_alpha = dCF.alpha[3]
@@ -1767,7 +1787,8 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
         vtail_height=vtail_height,
         vtail_x=vtail_x,
         mass_x=mass_x,
-        wing_x=wing_x
+        wing_x=wing_x,
+        fuselage_width = config.fuselage_width
     )
     
     # Get CG and components
@@ -1777,7 +1798,8 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
         vtail_height, vtail_chords;
         wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
         battery_x=battery_x, electronics_x=electronics_x,
-        ballast_mass=ballast_mass, ballast_x=ballast_x
+        ballast_mass=ballast_mass, ballast_x=ballast_x,
+        fuselage_width = config.fuselage_width
     )
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
@@ -1791,34 +1813,39 @@ function plot_top_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filename
     n = 2  # Two control points
     y_sections = [0.0, wing_half_span]
     
-    # Right wing
+    # Right wing - starts at fuselage edge
+    half_gap = config.fuselage_width / 2.0
     x_le_root = wing_x - 0.25 * wing_chords[1]
     x_le_tip = wing_x - 0.25 * wing_chords[2] + sweep
     x_te_root = x_le_root + wing_chords[1]
     x_te_tip = x_le_tip + wing_chords[2]
-    
-    # Leading edge
-    plot!([x_le_root, x_le_tip], [0.0, wing_half_span], 
-          color=:black, linewidth=2, label="Wing")
+
+    # Leading edge from fuselage edge to tip
+    plot!([x_le_root, x_le_tip], [half_gap, wing_half_span], 
+        color=:black, linewidth=2, label="Wing")
     # Trailing edge
-    plot!([x_te_root, x_te_tip], [0.0, wing_half_span], 
-          color=:black, linewidth=2, label="")
+    plot!([x_te_root, x_te_tip], [half_gap, wing_half_span], 
+        color=:black, linewidth=2, label="")
     # Tip
     plot!([x_te_tip, x_le_tip], [wing_half_span, wing_half_span], 
-          color=:black, linewidth=2, label="")
-    # Root (will be drawn for left side too)
-    
+        color=:black, linewidth=2, label="")
+    # Root at fuselage
+    plot!([x_te_root, x_le_root], [half_gap, half_gap], 
+        color=:black, linewidth=2, label="")
+
     # Left wing (mirror)
-    plot!([x_le_root, x_le_tip], [0.0, -wing_half_span], 
-          color=:black, linewidth=2, label="")
-    plot!([x_te_root, x_te_tip], [0.0, -wing_half_span], 
-          color=:black, linewidth=2, label="")
+    plot!([x_le_root, x_le_tip], [-half_gap, -wing_half_span], 
+        color=:black, linewidth=2, label="")
+    plot!([x_te_root, x_te_tip], [-half_gap, -wing_half_span], 
+        color=:black, linewidth=2, label="")
     plot!([x_te_tip, x_le_tip], [-wing_half_span, -wing_half_span], 
-          color=:black, linewidth=2, label="")
-    
-    # Close wing at root
-    plot!([x_te_root, x_le_root], [0.0, 0.0], 
-          color=:black, linewidth=2, label="")
+        color=:black, linewidth=2, label="")
+    plot!([x_te_root, x_le_root], [-half_gap, -half_gap],   
+        color=:black, linewidth=2, label="")
+
+    # Show fuselage gap
+    plot!([x_te_root, x_te_root], [-half_gap, half_gap],
+        color=:gray, linewidth=3, linestyle=:dash, label="Fuselage gap")
     
     # Horizontal tail (with taper)
     ht_xle_root = htail_x - 0.25 * htail_chords[1]
@@ -1929,7 +1956,8 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
         vtail_height=vtail_height,
         vtail_x=vtail_x,
         mass_x=mass_x,
-        wing_x=wing_x
+        wing_x=wing_x,
+        fuselage_width = config.fuselage_width
     )
     
     # Get CG and components
@@ -1939,7 +1967,8 @@ function plot_side_view(x::Vector{Float64}, config::DesignConfig=CONFIG; filenam
         vtail_height, vtail_chords;
         wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
         battery_x=battery_x, electronics_x=electronics_x,
-        ballast_mass=ballast_mass, ballast_x=ballast_x
+        ballast_mass=ballast_mass, ballast_x=ballast_x,
+        fuselage_width = config.fuselage_width
     )
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
@@ -2107,7 +2136,8 @@ function design_summary(x::Vector{Float64}, config::DesignConfig=CONFIG)
         vtail_height=vtail_height,
         vtail_x=vtail_x,
         mass_x=mass_x,
-        wing_x=wing_x
+        wing_x=wing_x,
+        fuselage_width = config.fuselage_width
     )
     
     # Get mass properties
@@ -2117,7 +2147,8 @@ function design_summary(x::Vector{Float64}, config::DesignConfig=CONFIG)
         vtail_height, vtail_chords;
         wing_x=wing_x, htail_x=htail_x, vtail_x=vtail_x,
         battery_x=battery_x, electronics_x=electronics_x,
-        ballast_mass=ballast_mass, ballast_x=ballast_x
+        ballast_mass=ballast_mass, ballast_x=ballast_x,
+        fuselage_width = config.fuselage_width
     )
     m_tot, cg, (Ixx, Iyy, Izz) = compute_inertia_from_components(comps)
     
@@ -2145,8 +2176,11 @@ function design_summary(x::Vector{Float64}, config::DesignConfig=CONFIG)
     println("\n" * "-"^70)
     println("WING")
     println("-"^70)
-    @printf("  Span:         %.3f m (%.1f in) - OPTIMIZED\n", 2*wing_half_span, 2*wing_half_span*39.3701)
-    @printf("  Root chord:   %.3f m (%.1f in)\n", wing_chords[1], wing_chords[1]*39.3701)
+    @printf("  Total span (tip-to-tip): %.3f m (%.1f in)\n", 2*wing_half_span, 2*wing_half_span*39.3701)
+    @printf("  Fuselage gap:            %.3f m (%.1f in)\n", config.fuselage_width, config.fuselage_width*39.3701)
+    actual_wing_span = 2*(wing_half_span - config.fuselage_width/2)
+    @printf("  Wing span (w/o gap):     %.3f m (%.1f in)\n", actual_wing_span, actual_wing_span*39.3701)
+    @printf("  Root chord:              %.3f m (%.1f in)\n", wing_chords[1], wing_chords[1]*39.3701)
     @printf("  Tip chord:    %.3f m (%.1f in)\n", wing_chords[2], wing_chords[2]*39.3701)
     @printf("  Taper ratio:  %.3f\n", wing_chords[2]/wing_chords[1])
     @printf("  Area:         %.4f m² (%.1f in²)\n", wing_area, wing_area*1550.0)
